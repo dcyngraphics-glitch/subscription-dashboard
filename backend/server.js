@@ -2,7 +2,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
+const { DatabaseSync } = require('node:sqlite');
 const crypto = require('crypto');
 require('dotenv').config();
 
@@ -13,14 +13,92 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Database setup
-const db = new sqlite3.Database('./dashboard.db', (err) => {
-  if (err) {
-    console.error('Error opening database:', err.message);
-  } else {
-    console.log('Connected to SQLite database.');
-  }
-});
+// Database setup (synchronous, built-in node:sqlite — no native deps)
+const db = new DatabaseSync('./dashboard.db');
+
+// Initialize schema (create tables if they don't exist)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+    status TEXT DEFAULT 'active' CHECK (status IN ('active', 'locked', 'past_due', 'canceled', 'pending')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS subscription_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    price_cents INTEGER NOT NULL,
+    billing_cycle TEXT NOT NULL CHECK (billing_cycle IN ('monthly', 'yearly')),
+    features TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS user_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_id INTEGER NOT NULL REFERENCES subscription_plans(id),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'past_due', 'canceled', 'pending')),
+    current_period_start TIMESTAMP NOT NULL,
+    current_period_end TIMESTAMP NOT NULL,
+    cancel_at_period_end BOOLEAN DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS usage_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    feature TEXT NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_agent TEXT,
+    language TEXT,
+    platform TEXT,
+    screen_resolution TEXT,
+    timezone TEXT,
+    hardware_concurrency INTEGER DEFAULT 0,
+    memory REAL,
+    touch_points INTEGER DEFAULT 0,
+    referrer TEXT DEFAULT 'direct',
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, user_agent, platform, screen_resolution)
+  );
+
+  CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    key TEXT UNIQUE NOT NULL,
+    name TEXT,
+    permissions TEXT DEFAULT '["read", "write"]',
+    last_used TIMESTAMP,
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
+  CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen);
+  CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user ON user_subscriptions(user_id);
+  CREATE INDEX IF NOT EXISTS idx_user_subscriptions_status ON user_subscriptions(status);
+  CREATE INDEX IF NOT EXISTS idx_usage_user_feature ON usage_records(user_id, feature);
+  CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_records(timestamp);
+
+  INSERT OR IGNORE INTO subscription_plans (name, price_cents, billing_cycle, features)
+  VALUES
+    ('free', 0, 'monthly', '["basic_exams"]'),
+    ('pro', 999, 'monthly', '["mock_exams", "ai_explanations", "unlimited_scans"]'),
+    ('enterprise', 2499, 'monthly', '["all_features", "priority_support", "team_management"]');
+`);
+
+console.log('Connected to SQLite database.');
 
 // JWT secret
 const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
@@ -55,21 +133,16 @@ app.post('/api/auth/register', async (req, res) => {
 
   try {
     const hashedPassword = await bcrypt.hash(password, 12);
-    const stmt = db.prepare('INSERT INTO users (email, password_hash) VALUES (?, ?)');
-    stmt.run(email, hashedPassword, function(err) {
-      if (err) {
-        if (err.code === 'SQLITE_CONSTRAINT') {
-          return res.status(409).json({ message: 'User already exists' });
-        }
-        return res.status(500).json({ message: 'Database error' });
-      }
-      const userId = this.lastID;
-      const token = jwt.sign({ id: userId, email, role: 'user' }, JWT_SECRET, { expiresIn: '1h' });
-      res.status(201).json({ token, user: { id: userId, email, role: 'user' } });
-    });
-    stmt.finalize();
+    const stmt = db.prepare('INSERT INTO users (email, password_hash, status) VALUES (?, ?, ?)');
+    const info = stmt.run(email, hashedPassword, 'pending');
+    const userId = Number(info.lastInsertRowid);
+    const token = jwt.sign({ id: userId, email, role: 'user' }, JWT_SECRET, { expiresIn: '1h' });
+    res.status(201).json({ token, user: { id: userId, email, role: 'user', status: 'pending' } });
   } catch (err) {
-    res.status(500).json({ message: 'Server error' });
+    if (err.code === 'ERR_SQLITE_ERROR' && err.message.includes('UNIQUE constraint')) {
+      return res.status(409).json({ message: 'User already exists' });
+    }
+    res.status(500).json({ message: 'Database error' });
   }
 });
 
@@ -79,38 +152,30 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(400).json({ message: 'Email and password required' });
   }
 
-  db.get('SELECT * FROM users WHERE email = ?', [email], async (err, row) => {
-    if (err) return res.status(500).json({ message: 'Database error' });
+  const row = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
 
-    // Auto-register new users with 'pending' status
-    if (!row) {
-      try {
-        const hashedPassword = await bcrypt.hash(password, 12);
-        const stmt = db.prepare('INSERT INTO users (email, password_hash, status) VALUES (?, ?, ?)');
-        stmt.run(email, hashedPassword, 'pending', function(err) {
-          if (err) {
-            if (err.code === 'SQLITE_CONSTRAINT') {
-              return res.status(409).json({ message: 'User already exists' });
-            }
-            return res.status(500).json({ message: 'Database error' });
-          }
-          const userId = this.lastID;
-          const token = jwt.sign({ id: userId, email, role: 'user' }, JWT_SECRET, { expiresIn: '1h' });
-          return res.status(201).json({ token, user: { id: userId, email, role: 'user', status: 'pending' } });
-        });
-        stmt.finalize();
-      } catch (err) {
-        return res.status(500).json({ message: 'Server error' });
+  // Auto-register new users with 'pending' status
+  if (!row) {
+    try {
+      const hashedPassword = bcrypt.hashSync(password, 12);
+      const stmt = db.prepare('INSERT INTO users (email, password_hash, status) VALUES (?, ?, ?)');
+      const info = stmt.run(email, hashedPassword, 'pending');
+      const userId = Number(info.lastInsertRowid);
+      const token = jwt.sign({ id: userId, email, role: 'user' }, JWT_SECRET, { expiresIn: '1h' });
+      return res.status(201).json({ token, user: { id: userId, email, role: 'user', status: 'pending' } });
+    } catch (err) {
+      if (err.code === 'ERR_SQLITE_ERROR' && err.message.includes('UNIQUE constraint')) {
+        return res.status(409).json({ message: 'User already exists' });
       }
-      return;
+      return res.status(500).json({ message: 'Database error' });
     }
+  }
 
-    const validPassword = await bcrypt.compare(password, row.password_hash);
-    if (!validPassword) return res.status(401).json({ message: 'Invalid credentials' });
+  const validPassword = bcrypt.compareSync(password, row.password_hash);
+  if (!validPassword) return res.status(401).json({ message: 'Invalid credentials' });
 
-    const token = jwt.sign({ id: row.id, email: row.email, role: row.role }, JWT_SECRET, { expiresIn: '1h' });
-    res.json({ token, user: { id: row.id, email: row.email, role: row.role, status: row.status } });
-  });
+  const token = jwt.sign({ id: row.id, email: row.email, role: row.role }, JWT_SECRET, { expiresIn: '1h' });
+  res.json({ token, user: { id: row.id, email: row.email, role: row.role, status: row.status } });
 });
 
 // Token validation endpoint (used by apps to check user status)
@@ -120,99 +185,81 @@ app.post('/api/auth/validate', (req, res) => {
 
   // Cross-app validation by email (used by LET Prep and other integrated apps)
   if (email && !token) {
-    db.get('SELECT id, email, role, status FROM users WHERE email = ?', [email], (err, row) => {
-      if (err) {
-        return res.status(500).json({ valid: false, message: 'Database error' });
-      }
-      if (!row) {
-        return res.json({ valid: false, message: 'User not found' });
-      }
-      return res.json({ valid: true, user: row });
-    });
-    return;
+    const row = db.prepare('SELECT id, email, role, status FROM users WHERE email = ?').get(email);
+    if (!row) {
+      return res.json({ valid: false, message: 'User not found' });
+    }
+    return res.json({ valid: true, user: row });
   }
 
   if (!token) {
     return res.status(400).json({ valid: false, message: 'Token or email required' });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return res.json({ valid: false, message: 'Invalid or expired token' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const row = db.prepare('SELECT id, email, role, status FROM users WHERE id = ?').get(decoded.id);
+    if (!row) {
+      return res.json({ valid: false, message: 'User not found' });
     }
-
-    db.get('SELECT id, email, role, status FROM users WHERE id = ?', [decoded.id], (err, row) => {
-      if (err) {
-        return res.status(500).json({ valid: false, message: 'Database error' });
-      }
-      if (!row) {
-        return res.json({ valid: false, message: 'User not found' });
-      }
-      res.json({ valid: true, user: row });
-    });
-  });
+    res.json({ valid: true, user: row });
+  } catch (err) {
+    return res.json({ valid: false, message: 'Invalid or expired token' });
+  }
 });
 
 // User routes (admin only)
 app.get('/api/users', authenticateToken, authorizeAdmin, (req, res) => {
-  db.all('SELECT id, email, role, status, created_at FROM users ORDER BY created_at DESC', [], (err, rows) => {
-    if (err) return res.status(500).json({ message: 'Database error' });
-    res.json(rows);
-  });
+  const rows = db.prepare('SELECT id, email, role, status, created_at FROM users ORDER BY created_at DESC').all();
+  res.json(rows);
 });
 
 app.patch('/api/users/:id/lock', authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
-  db.run('UPDATE users SET status = ? WHERE id = ?', ['locked', id], function(err) {
-    if (err) return res.status(500).json({ message: 'Database error' });
-    if (this.changes === 0) return res.status(404).json({ message: 'User not found' });
-    res.json({ message: 'User locked successfully' });
-  });
+  const stmt = db.prepare('UPDATE users SET status = ? WHERE id = ?');
+  const info = stmt.run('locked', id);
+  if (info.changes === 0) return res.status(404).json({ message: 'User not found' });
+  res.json({ message: 'User locked successfully' });
 });
 
 app.patch('/api/users/:id/unlock', authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
-  db.run('UPDATE users SET status = ? WHERE id = ?', ['active', id], function(err) {
-    if (err) return res.status(500).json({ message: 'Database error' });
-    if (this.changes === 0) return res.status(404).json({ message: 'User not found' });
-    res.json({ message: 'User unlocked successfully' });
-  });
+  const stmt = db.prepare('UPDATE users SET status = ? WHERE id = ?');
+  const info = stmt.run('active', id);
+  if (info.changes === 0) return res.status(404).json({ message: 'User not found' });
+  res.json({ message: 'User unlocked successfully' });
 });
 
 // Approve user (admin only)
 app.patch('/api/users/:id/approve', authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
-  db.run('UPDATE users SET status = ? WHERE id = ?', ['active', id], function(err) {
-    if (err) return res.status(500).json({ message: 'Database error' });
-    if (this.changes === 0) return res.status(404).json({ message: 'User not found' });
-    res.json({ message: 'User approved successfully' });
-  });
+  const stmt = db.prepare('UPDATE users SET status = ? WHERE id = ?');
+  const info = stmt.run('active', id);
+  if (info.changes === 0) return res.status(404).json({ message: 'User not found' });
+  res.json({ message: 'User approved successfully' });
 });
 
 // Deny user (admin only)
 app.patch('/api/users/:id/deny', authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
-  db.run('UPDATE users SET status = ? WHERE id = ?', ['locked', id], function(err) {
-    if (err) return res.status(500).json({ message: 'Database error' });
-    if (this.changes === 0) return res.status(404).json({ message: 'User not found' });
-    res.json({ message: 'User denied successfully' });
-  });
+  const stmt = db.prepare('UPDATE users SET status = ? WHERE id = ?');
+  const info = stmt.run('locked', id);
+  if (info.changes === 0) return res.status(404).json({ message: 'User not found' });
+  res.json({ message: 'User denied successfully' });
 });
 
 // Subscription routes
 app.get('/api/subscriptions', authenticateToken, authorizeAdmin, (req, res) => {
   const query = `
-    SELECT us.id, u.email, sp.name as plan_name, us.status, 
+    SELECT us.id, u.email, sp.name as plan_name, us.status,
            us.current_period_start, us.current_period_end, us.cancel_at_period_end
     FROM user_subscriptions us
     JOIN users u ON us.user_id = u.id
     JOIN subscription_plans sp ON us.plan_id = sp.id
     ORDER BY us.created_at DESC
   `;
-  db.all(query, [], (err, rows) => {
-    if (err) return res.status(500).json({ message: 'Database error' });
-    res.json(rows);
-  });
+  const rows = db.prepare(query).all();
+  res.json(rows);
 });
 
 // Usage tracking
@@ -221,11 +268,8 @@ app.post('/api/usage', authenticateToken, (req, res) => {
   if (!feature) return res.status(400).json({ message: 'Feature required' });
 
   const stmt = db.prepare('INSERT INTO usage_records (user_id, feature, quantity) VALUES (?, ?, ?)');
-  stmt.run(req.user.id, feature, quantity, function(err) {
-    if (err) return res.status(500).json({ message: 'Database error' });
-    res.status(201).json({ id: this.lastID });
-  });
-  stmt.finalize();
+  const info = stmt.run(req.user.id, feature, quantity);
+  res.status(201).json({ id: Number(info.lastInsertRowid) });
 });
 
 // Device tracking — called by barcode scanner app on login/visit
@@ -239,12 +283,13 @@ app.post('/api/device/track', authenticateToken, (req, res) => {
   const screenRes = device.screenResolution || '';
 
   // Upsert: update last_seen if same device fingerprint exists
-  db.run(`
+  const stmt = db.prepare(`
     INSERT INTO devices (user_id, user_agent, language, platform, screen_resolution, timezone, hardware_concurrency, memory, touch_points, referrer, last_seen)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ON CONFLICT(user_id, user_agent, platform, screen_resolution)
     DO UPDATE SET last_seen = CURRENT_TIMESTAMP
-  `, [
+  `);
+  const info = stmt.run(
     userId,
     ua,
     device.language || '',
@@ -254,11 +299,9 @@ app.post('/api/device/track', authenticateToken, (req, res) => {
     device.hardwareConcurrency || 0,
     device.memory || null,
     device.touchPoints || 0,
-    device.referrer || 'direct',
-  ], function(err) {
-    if (err) return res.status(500).json({ message: 'Database error' });
-    res.json({ id: this.lastID });
-  });
+    device.referrer || 'direct'
+  );
+  res.json({ id: Number(info.lastInsertRowid) });
 });
 
 // List devices (admin only) — for dashboard to view who's using the app
@@ -270,51 +313,33 @@ app.get('/api/devices', authenticateToken, authorizeAdmin, (req, res) => {
     JOIN users u ON d.user_id = u.id
     ORDER BY d.last_seen DESC
   `;
-  db.all(query, [], (err, rows) => {
-    if (err) return res.status(500).json({ message: 'Database error' });
-    res.json(rows);
-  });
+  const rows = db.prepare(query).all();
+  res.json(rows);
 });
 
 // Dashboard stats
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, (req, res) => {
   const stats = {};
-  db.serialize(() => {
-    db.get('SELECT COUNT(*) as totalUsers FROM users', [], (err, row) => {
-      if (err) return;
-      stats.totalUsers = row.totalUsers;
-    });
-    db.get('SELECT COUNT(*) as activeUsers FROM users WHERE status = ?', ['active'], (err, row) => {
-      if (err) return;
-      stats.activeUsers = row.activeUsers;
-    });
-    db.get('SELECT COUNT(*) as lockedUsers FROM users WHERE status = ?', ['locked'], (err, row) => {
-      if (err) return;
-      stats.lockedUsers = row.lockedUsers;
-    });
-    db.get(`
-      SELECT COUNT(*) as activeSubscriptions 
-      FROM user_subscriptions 
-      WHERE status = ?`, ['active'], (err, row) => {
-      if (err) return;
-      stats.activeSubscriptions = row.activeSubscriptions;
-    });
-    db.get(`
-      SELECT SUM(quantity) as totalUsage 
-      FROM usage_records 
-      WHERE timestamp >= datetime('now', '-30 days')`, [], (err, row) => {
-      if (err) return;
-      stats.totalUsage = row.totalUsage || 0;
-    });
-    db.get('SELECT COUNT(*) as totalDevices FROM devices', [], (err, row) => {
-      if (err) return;
-      stats.totalDevices = row.totalDevices || 0;
-    });
-  });
 
-  setTimeout(() => {
-    res.json(stats);
-  }, 100);
+  const r1 = db.prepare('SELECT COUNT(*) as totalUsers FROM users').get();
+  stats.totalUsers = r1.totalUsers;
+
+  const r2 = db.prepare('SELECT COUNT(*) as activeUsers FROM users WHERE status = ?').get('active');
+  stats.activeUsers = r2.activeUsers;
+
+  const r3 = db.prepare('SELECT COUNT(*) as lockedUsers FROM users WHERE status = ?').get('locked');
+  stats.lockedUsers = r3.lockedUsers;
+
+  const r4 = db.prepare('SELECT COUNT(*) as activeSubscriptions FROM user_subscriptions WHERE status = ?').get('active');
+  stats.activeSubscriptions = r4.activeSubscriptions || 0;
+
+  const r5 = db.prepare('SELECT SUM(quantity) as totalUsage FROM usage_records WHERE timestamp >= datetime(\'now\', \'-30 days\')').get();
+  stats.totalUsage = (r5 && r5.totalUsage) || 0;
+
+  const r6 = db.prepare('SELECT COUNT(*) as totalDevices FROM devices').get();
+  stats.totalDevices = r6.totalDevices || 0;
+
+  res.json(stats);
 });
 
 // Start server
