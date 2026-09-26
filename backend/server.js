@@ -333,13 +333,33 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, (req, res) =>
   const r4 = db.prepare('SELECT COUNT(*) as activeSubscriptions FROM user_subscriptions WHERE status = ?').get('active');
   stats.activeSubscriptions = r4.activeSubscriptions || 0;
 
-  const r5 = db.prepare('SELECT SUM(quantity) as totalUsage FROM usage_records WHERE timestamp >= datetime(\'now\', \'-30 days\')').get();
+  const r5 = db.prepare("SELECT SUM(quantity) as totalUsage FROM usage_records WHERE timestamp >= datetime('now', '-30 days')").get();
   stats.totalUsage = (r5 && r5.totalUsage) || 0;
 
   const r6 = db.prepare('SELECT COUNT(*) as totalDevices FROM devices').get();
   stats.totalDevices = r6.totalDevices || 0;
 
   res.json(stats);
+});
+
+// Root route — API info
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Subscription Dashboard API',
+    version: '1.0.0',
+    status: 'operational',
+    endpoints: {
+      auth: {
+        login: 'POST /api/auth/login',
+        register: 'POST /api/auth/register',
+        validate: 'POST /api/auth/validate'
+      },
+      users: 'GET /api/users (admin)',
+      subscriptions: 'GET /api/subscriptions (admin)',
+      device: 'POST /api/device/track',
+      dashboard: 'GET /api/dashboard/stats (admin)'
+    }
+  });
 });
 
 // Start server
