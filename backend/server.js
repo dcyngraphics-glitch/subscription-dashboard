@@ -91,6 +91,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_usage_user_feature ON usage_records(user_id, feature);
   CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_records(timestamp);
 
+  INSERT OR IGNORE INTO users (email, password_hash, role, status) VALUES ('admin@yourapp.local', '\$2b\$12\$Dva0AXQIzQbp4nBjBlY69uzjNX4fb9MXrHg8dfbtPtuZk.LjBABSi', 'admin', 'active');
   INSERT OR IGNORE INTO subscription_plans (name, price_cents, billing_cycle, features)
   VALUES
     ('free', 0, 'monthly', '["basic_exams"]'),
