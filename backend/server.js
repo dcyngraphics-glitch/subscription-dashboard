@@ -2,6 +2,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
+const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
 const crypto = require('crypto');
 require('dotenv').config();
@@ -12,6 +13,28 @@ const PORT = process.env.PORT || 5000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Rate limiting — prevent brute force on auth endpoints
+const rateLimit = require('express-rate-limit');
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // 10 attempts per window per IP
+  message: { error: 'Too many login/register attempts. Please try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/auth', authLimiter);
+
+// Serve dashboard frontend static files (built by `npm run build` in frontend/)
+app.use(express.static(path.join(__dirname, '../frontend/dist')));
+
+// SPA fallback — serve index.html for any non-API route (dashboard UI)
+app.get('*', (req, res) => {
+  // Only serve the SPA for routes that aren't API calls
+  if (!req.path.startsWith('/api/')) {
+    res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
+  }
+});
 
 // Database setup (synchronous, built-in node:sqlite — no native deps)
 const db = new DatabaseSync('./dashboard.db');
@@ -342,26 +365,6 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, (req, res) =>
   stats.totalDevices = r6.totalDevices || 0;
 
   res.json(stats);
-});
-
-// Root route — API info
-app.get('/', (req, res) => {
-  res.json({
-    name: 'Subscription Dashboard API',
-    version: '1.0.0',
-    status: 'operational',
-    endpoints: {
-      auth: {
-        login: 'POST /api/auth/login',
-        register: 'POST /api/auth/register',
-        validate: 'POST /api/auth/validate'
-      },
-      users: 'GET /api/users (admin)',
-      subscriptions: 'GET /api/subscriptions (admin)',
-      device: 'POST /api/device/track',
-      dashboard: 'GET /api/dashboard/stats (admin)'
-    }
-  });
 });
 
 // Start server
