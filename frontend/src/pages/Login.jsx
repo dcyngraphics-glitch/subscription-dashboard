@@ -18,15 +18,13 @@ export default function Login() {
     setError('');
 
     try {
-      const response = await apiFetch('/api/auth/login', {
+      const data = await apiFetch('/api/auth/login', {
         method: 'POST',
         body: JSON.stringify({ email, password }),
       });
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.message || 'Login failed');
+      if (!data || !data.token) {
+        throw new Error(data?.message || 'Login failed');
       }
 
       login(data.token, data.user);
