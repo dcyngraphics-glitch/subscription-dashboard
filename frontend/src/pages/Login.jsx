@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useAuth } from '../context/AuthContext';
+import { useAuth, useApi } from '../context/AuthContext';
 import { useNavigate } from 'react-router-dom';
 
 export default function Login() {
@@ -9,6 +9,7 @@ export default function Login() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const { login } = useAuth();
+  const apiFetch = useApi();
   const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
@@ -17,11 +18,8 @@ export default function Login() {
     setError('');
 
     try {
-      const response = await fetch(`${API_URL}/api/auth/login`, {
+      const response = await apiFetch('/api/auth/login', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
         body: JSON.stringify({ email, password }),
       });
 

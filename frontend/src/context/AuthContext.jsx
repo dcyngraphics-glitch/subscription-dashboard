@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+const API_URL = import.meta.env.VITE_API_URL || window.location.origin;
 
 const AuthContext = createContext();
 
@@ -23,7 +23,10 @@ export const useApi = () => {
         ...options.headers,
       },
     });
-    if (!res.ok) throw new Error(`API error: ${res.status}`);
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.message || `API error: ${res.status}`);
+    }
     return res.json();
   };
   return { apiFetch };
