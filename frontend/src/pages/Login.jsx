@@ -9,7 +9,7 @@ export default function Login() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const { login } = useAuth();
-  const apiFetch = useApi();
+  const { apiFetch } = useApi();
   const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
