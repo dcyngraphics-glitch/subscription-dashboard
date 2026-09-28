@@ -25,15 +25,22 @@ const authLimiter = rateLimit({
 });
 app.use('/api/auth', authLimiter);
 
-// Serve dashboard frontend static files (built by `npm run build` in frontend/)
-app.use(express.static(path.join(__dirname, '../frontend/dist')));
-
-// SPA fallback — serve index.html for any non-API route (dashboard UI)
-app.get('*', (req, res) => {
-  // Only serve the SPA for routes that aren't API calls
-  if (!req.path.startsWith('/api/')) {
-    res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
+// Serve dashboard frontend — serve static assets + SPA fallback in one middleware
+const fs = require('fs');
+const distPath = path.join(__dirname, '../frontend/dist');
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    return next();
   }
+  // Try to serve a static file from dist (JS, CSS, images, etc.)
+  const filePath = path.join(distPath, req.path);
+  fs.stat(filePath, (err, stats) => {
+    if (!err && stats.isFile()) {
+      return res.sendFile(filePath);
+    }
+    // Not a static file — serve the SPA index.html (React Router handles routing)
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
 });
 
 // Database setup (synchronous, built-in node:sqlite — no native deps)
