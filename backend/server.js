@@ -18,8 +18,8 @@ app.use(express.json());
 const rateLimit = require('express-rate-limit');
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // 10 attempts per window per IP
-  message: { error: 'Too many login/register attempts. Please try again in 15 minutes.' },
+  max: 30, // 10 attempts per window per IP
+  message: { error: 'Too many login/register attempts (max 30 per 15 minutes). Please try again later.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
