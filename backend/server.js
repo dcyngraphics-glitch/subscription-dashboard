@@ -168,7 +168,7 @@ app.post('/api/auth/register', async (req, res) => {
     const stmt = db.prepare('INSERT INTO users (email, password_hash, status) VALUES (?, ?, ?)');
     const info = stmt.run(email, hashedPassword, 'pending');
     const userId = Number(info.lastInsertRowid);
-    const token = jwt.sign({ id: userId, email, role: 'user' }, JWT_SECRET, { expiresIn: '1h' });
+    const token = jwt.sign({ id: userId, email, role: 'user' }, JWT_SECRET, { expiresIn: '30d' });
     res.status(201).json({ token, user: { id: userId, email, role: 'user', status: 'pending' } });
   } catch (err) {
     if (err.code === 'ERR_SQLITE_ERROR' && err.message.includes('UNIQUE constraint')) {
@@ -193,7 +193,7 @@ app.post('/api/auth/login', (req, res) => {
       const stmt = db.prepare('INSERT INTO users (email, password_hash, status) VALUES (?, ?, ?)');
       const info = stmt.run(email, hashedPassword, 'pending');
       const userId = Number(info.lastInsertRowid);
-      const token = jwt.sign({ id: userId, email, role: 'user' }, JWT_SECRET, { expiresIn: '1h' });
+      const token = jwt.sign({ id: userId, email, role: 'user' }, JWT_SECRET, { expiresIn: '30d' });
 
       // Track device on signup (even for pending users)
       if (device) {
