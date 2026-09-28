@@ -179,7 +179,7 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, device } = req.body;
   if (!email || !password) {
     return res.status(400).json({ message: 'Email and password required' });
   }
@@ -194,6 +194,21 @@ app.post('/api/auth/login', (req, res) => {
       const info = stmt.run(email, hashedPassword, 'pending');
       const userId = Number(info.lastInsertRowid);
       const token = jwt.sign({ id: userId, email, role: 'user' }, JWT_SECRET, { expiresIn: '1h' });
+
+      // Track device on signup (even for pending users)
+      if (device) {
+        const ua = device.userAgent || '';
+        const platform = device.platform || '';
+        const screenRes = device.screenResolution || '';
+        const stmt2 = db.prepare(
+          `INSERT INTO devices (user_id, user_agent, language, platform, screen_resolution, timezone, hardware_concurrency, memory, touch_points, referrer, first_seen, last_seen)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+           ON CONFLICT(user_id, user_agent, platform, screen_resolution)
+           DO UPDATE SET last_seen = CURRENT_TIMESTAMP`
+        );
+        stmt2.run(userId, ua, device.language || '', platform, screenRes, device.timezone || '', device.hardwareConcurrency || 0, device.memory || null, device.touchPoints || 0, device.referrer || 'direct');
+      }
+
       return res.status(201).json({ token, user: { id: userId, email, role: 'user', status: 'pending' } });
     } catch (err) {
       if (err.code === 'ERR_SQLITE_ERROR' && err.message.includes('UNIQUE constraint')) {
@@ -207,6 +222,21 @@ app.post('/api/auth/login', (req, res) => {
   if (!validPassword) return res.status(401).json({ message: 'Invalid credentials' });
 
   const token = jwt.sign({ id: row.id, email: row.email, role: row.role }, JWT_SECRET, { expiresIn: '1h' });
+
+  // Track device on login (for all users including pending)
+  if (device) {
+    const ua = device.userAgent || '';
+    const platform = device.platform || '';
+    const screenRes = device.screenResolution || '';
+    const stmt2 = db.prepare(
+      `INSERT INTO devices (user_id, user_agent, language, platform, screen_resolution, timezone, hardware_concurrency, memory, touch_points, referrer, first_seen, last_seen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT first_seen FROM devices WHERE user_id = ? AND user_agent = ? AND platform = ? AND screen_resolution = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
+       ON CONFLICT(user_id, user_agent, platform, screen_resolution)
+       DO UPDATE SET last_seen = CURRENT_TIMESTAMP`
+    );
+    stmt2.run(userId, ua, device.language || '', platform, screenRes, device.timezone || '', device.hardwareConcurrency || 0, device.memory || null, device.touchPoints || 0, device.referrer || 'direct', row.id, ua, platform, screenRes);
+  }
+
   res.json({ token, user: { id: row.id, email: row.email, role: row.role, status: row.status } });
 });
 
